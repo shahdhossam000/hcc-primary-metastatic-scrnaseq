@@ -124,7 +124,7 @@ primarily by transcriptional reprogramming within existing cell
 populations, rather than by large shifts in overall cell-type
 composition — consistent with the conclusions of Lu et al. (2022).
 
-See **[RESULTS_SUMMARY (2).md](RESULTS_SUMMARY (2).md)** for the complete
+See **[RESULTS_SUMMARY (2).md]([RESULTS_SUMMARY (2).md](https://github.com/shahdhossam000/hcc-primary-metastatic-scrnaseq/blob/3e935e9d5b87d7d26d11613a4694197352388101/RESULTS_SUMMARY%20(2).md))** for the complete
 write-up with full interpretation and limitations.
 
 ## Citation
