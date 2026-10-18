@@ -124,7 +124,7 @@ primarily by transcriptional reprogramming within existing cell
 populations, rather than by large shifts in overall cell-type
 composition — consistent with the conclusions of Lu et al. (2022).
 
-See **[RESULTS_SUMMARY.md](RESULTS_SUMMARY.md)** for the complete
+See **[RESULTS_SUMMARY (2).md](RESULTS_SUMMARY (2).md)** for the complete
 write-up with full interpretation and limitations.
 
 ## Citation
