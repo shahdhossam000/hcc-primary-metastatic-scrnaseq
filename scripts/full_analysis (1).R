@@ -1,0 +1,553 @@
+## =================================================================
+## HCC scRNA-seq Analysis: Primary vs Metastatic Hepatocellular
+## Carcinoma — Cellular Composition & Transcriptional Landscape
+##
+## Data source: Lu et al. 2022, Nat Commun 13:4594
+## https://doi.org/10.1038/s41467-022-32283-3
+## Processed data: GEO accession GSE149614
+##
+## Research question:
+## How does the cellular composition and transcriptional landscape
+## differ between primary and metastatic hepatocellular carcinoma?
+##
+## HOW TO USE THIS SCRIPT:
+## Run section by section, in order, from top to bottom. Each
+## section is self-contained and prints/saves a specific result
+## (a table, a figure, or a checkpoint .rds file). Do not skip
+## sections — later sections depend on objects created earlier.
+##
+## IMPORTANT — before running: edit the path marked
+## "CHANGE THIS" below to match your own machine.
+## =================================================================
+
+
+## =================================================================
+## SECTION 0 — Setup: libraries and library path
+## =================================================================
+
+## CHANGE THIS: set to wherever your R packages are installed.
+## (Only needed if you installed packages to a custom location,
+## e.g. a drive other than C: due to limited disk space.)
+# .libPaths("D:/R-library")
+
+library(GEOquery)
+library(Seurat)
+library(tidyverse)
+library(data.table)
+library(R.utils)
+library(pheatmap)
+library(patchwork)
+library(ggrepel)
+
+
+## =================================================================
+## SECTION 1 — Download data from GEO
+## Result: 3 files appear in data/
+## =================================================================
+
+dir.create("data", showWarnings = FALSE)
+dir.create("results", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+
+getGEOSuppFiles(
+  GEO           = "GSE149614",
+  baseDir       = "data",
+  makeDirectory = FALSE
+)
+
+list.files("data")
+## Expect to see:
+##   GSE149614_HCC.metadata.updated.txt.gz
+##   GSE149614_HCC.scRNAseq.S71915.count.txt.gz
+##   GSE149614_HCC.scRNAseq.S71915.normalized.txt.gz
+
+
+## =================================================================
+## SECTION 2 — Decompress the counts file
+## Result: data/unzipped/GSE149614_HCC.scRNAseq.S71915.count.txt
+## =================================================================
+
+dir.create("data/unzipped", showWarnings = FALSE)
+
+counts_txt_path <- "data/unzipped/GSE149614_HCC.scRNAseq.S71915.count.txt"
+
+if (!file.exists(counts_txt_path)) {
+  gunzip(
+    "data/GSE149614_HCC.scRNAseq.S71915.count.txt.gz",
+    destname  = counts_txt_path,
+    remove    = FALSE,
+    overwrite = TRUE
+  )
+}
+
+file.exists(counts_txt_path)   # should be TRUE
+
+
+## =================================================================
+## SECTION 3 — Identify samples from the counts file header
+## Result: sample_prefixes = character vector of 21 sample codes
+## =================================================================
+
+header    <- fread(counts_txt_path, nrows = 0)
+col_names <- colnames(header)
+rm(header); gc()
+
+## Sample codes are embedded in the cell barcode prefix, e.g.
+## "HCC01T_AAACCTGAGGGCATGT" -> sample "HCC01T"
+## Suffix meaning: T = primary Tumor (PT), N = Normal liver (NTL),
+##                 P = PVTT, L = Lymph node metastasis (MLN)
+sample_prefixes <- unique(sub("_.*", "", col_names[-1]))
+
+length(sample_prefixes)   # should be 21
+sample_prefixes
+
+
+## =================================================================
+## SECTION 4 — Build one Seurat object per sample (memory-safe)
+## Result: data/seurat_list_21_samples.rds
+## This section is the slowest step (~20-40 min). Do not interrupt
+## it once started.
+## =================================================================
+
+seurat_list <- list()
+
+for (s in sample_prefixes) {
+
+  message("Processing sample: ", s)
+
+  cols_s <- c("V1", col_names[grepl(paste0("^", s, "_"), col_names)])
+
+  counts_s <- fread(counts_txt_path, select = cols_s)
+
+  gene_names_s <- counts_s$V1
+  mat_s <- as.matrix(counts_s[, -1])
+  rownames(mat_s) <- gene_names_s
+  rm(counts_s)
+
+  seurat_list[[s]] <- CreateSeuratObject(
+    counts       = mat_s,
+    project      = s,
+    min.cells    = 0,
+    min.features = 0
+  )
+
+  rm(mat_s)
+  gc()
+}
+
+message("All samples processed. Total objects: ", length(seurat_list))
+
+saveRDS(seurat_list, "data/seurat_list_21_samples.rds")
+
+
+## =================================================================
+## SECTION 5 — Merge samples, fix cell names, attach metadata
+## Result: data/seu_merged_raw.rds  (25,712 genes x 71,915 cells)
+## =================================================================
+
+seurat_list <- readRDS("data/seurat_list_21_samples.rds")
+
+seu_merged <- merge(
+  x = seurat_list[[1]],
+  y = seurat_list[-1],
+  add.cell.ids = names(seurat_list)
+)
+
+## Fix duplicated sample-name prefix introduced by add.cell.ids
+## (original barcodes already contained the sample name)
+new_names <- sub("^([^_]+)_\\1_", "\\1_", colnames(seu_merged))
+seu_merged <- RenameCells(seu_merged, new.names = new_names)
+
+## Attach the authors' cell-level metadata
+cell_meta <- fread("data/GSE149614_HCC.metadata.updated.txt.gz")
+cell_meta_ordered <- cell_meta[match(colnames(seu_merged), cell_meta$Cell), ]
+
+stopifnot(sum(is.na(cell_meta_ordered$Cell)) == 0)  # sanity check
+
+seu_merged$patient        <- cell_meta_ordered$patient
+seu_merged$site           <- cell_meta_ordered$site
+seu_merged$celltype_paper <- cell_meta_ordered$celltype
+seu_merged$stage          <- cell_meta_ordered$stage
+seu_merged$virus          <- cell_meta_ordered$virus
+
+## Standardize tissue labels to match paper terminology
+seu_merged$tissue <- recode(seu_merged$site,
+  "Normal" = "NTL",
+  "Tumor"  = "PT",
+  "PVTT"   = "PVTT",
+  "Lymph"  = "MLN"
+)
+
+table(seu_merged$tissue)          # NTL=28687 PT=34414 PVTT=5971 MLN=2843
+table(seu_merged$celltype_paper)  # matches paper's Fig. 1 counts
+
+saveRDS(seu_merged, "data/seu_merged_raw.rds")
+
+
+## =================================================================
+## SECTION 6 — Quality Control
+## Result: data/seu_merged_after_qc.rds (67,101 cells retained)
+## =================================================================
+
+seu_merged <- readRDS("data/seu_merged_raw.rds")
+
+seu_merged[["percent.mt"]] <- PercentageFeatureSet(seu_merged, pattern = "^MT-")
+
+VlnPlot(seu_merged, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        pt.size = 0)
+
+## Same thresholds used by the original paper
+seu_merged <- subset(
+  seu_merged,
+  subset = nFeature_RNA > 200 & nFeature_RNA < 8000 & percent.mt < 10
+)
+
+dim(seu_merged)   # 25712 67101
+
+saveRDS(seu_merged, "data/seu_merged_after_qc.rds")
+
+
+## =================================================================
+## SECTION 7 — Normalization, feature selection, scaling
+## Result: data/seu_merged_after_scaling.rds
+## =================================================================
+
+seu_merged <- readRDS("data/seu_merged_after_qc.rds")
+
+## Split by patient so each patient can be normalized/integrated
+## as its own batch
+seu_merged[["RNA"]] <- split(seu_merged[["RNA"]], f = seu_merged$patient)
+
+seu_merged <- NormalizeData(seu_merged)
+seu_merged <- FindVariableFeatures(seu_merged)
+
+## Scale only the ~2000 variable genes (scaling all 25,712 genes
+## can exhaust RAM on machines with 16 GB)
+seu_merged <- ScaleData(seu_merged, features = VariableFeatures(seu_merged))
+
+saveRDS(seu_merged, "data/seu_merged_after_scaling.rds")
+
+
+## =================================================================
+## SECTION 8 — PCA
+## Result: data/seu_merged_after_pca.rds
+## =================================================================
+
+seu_merged <- readRDS("data/seu_merged_after_scaling.rds")
+
+seu_merged <- RunPCA(seu_merged)
+
+saveRDS(seu_merged, "data/seu_merged_after_pca.rds")
+
+
+## =================================================================
+## SECTION 9 — Integration across patients (batch correction)
+## Result: data/seu_merged_after_integration.rds
+##
+## NOTE: CCAIntegration can hang/run very slowly on large datasets
+## with limited RAM. RPCAIntegration is much faster and gave a
+## clean result in this analysis.
+## =================================================================
+
+seu_merged <- readRDS("data/seu_merged_after_pca.rds")
+
+seu_merged <- IntegrateLayers(
+  object         = seu_merged,
+  method         = RPCAIntegration,
+  orig.reduction = "pca",
+  new.reduction  = "integrated.rpca"
+)
+
+saveRDS(seu_merged, "data/seu_merged_after_integration.rds")
+
+
+## =================================================================
+## SECTION 10 — UMAP + Clustering
+## Result: data/seu_merged_after_clustering.rds
+## =================================================================
+
+seu_merged <- readRDS("data/seu_merged_after_integration.rds")
+
+seu_merged <- RunUMAP(seu_merged, reduction = "integrated.rpca", dims = 1:30)
+seu_merged <- FindNeighbors(seu_merged, reduction = "integrated.rpca", dims = 1:30)
+seu_merged <- FindClusters(seu_merged, resolution = 1.0)
+
+## 29 clusters found
+
+saveRDS(seu_merged, "data/seu_merged_after_clustering.rds")
+
+
+## =================================================================
+## SECTION 11 — Annotation (assign a cell type to each cluster)
+## Result: data/seu_final_annotated.rds — the master analysis file
+##
+## Strategy: each cluster is assigned the majority cell type from
+## the authors' original per-cell annotation (celltype_paper).
+## This validates our independent clustering against the published
+## atlas rather than re-deriving marker genes from scratch.
+## =================================================================
+
+seu_merged <- readRDS("data/seu_merged_after_clustering.rds")
+
+cluster_composition <- table(seu_merged$seurat_clusters, seu_merged$celltype_paper)
+cluster_annotations <- apply(cluster_composition, 1, function(x) names(which.max(x)))
+
+seu_merged$major_celltype <- unname(cluster_annotations[as.character(seu_merged$seurat_clusters)])
+
+table(seu_merged$major_celltype)
+## B=3709 Endothelial=3661 Fibroblast=1997 Hepatocyte=19488
+## Myeloid=15219 T/NK=23027
+## (compare with table(seu_merged$celltype_paper); small differences are
+## expected because QC removed cells and clusters were named by majority vote)
+
+saveRDS(seu_merged, "data/seu_final_annotated.rds")
+
+
+## =================================================================
+## SECTION 12 — RESEARCH QUESTION, PART 1: Cellular composition
+## PT vs metastatic sites (PVTT, MLN)
+## Result: results/composition_PT_vs_Metastatic.csv
+##         figures/05_composition_stacked_bar.png
+## =================================================================
+
+seu_merged <- readRDS("data/seu_final_annotated.rds")
+
+## IMPORTANT: join per-patient expression layers into one before any
+## downstream differential expression / plotting (Seurat v5 requirement).
+## Done here so Sections 12-16 can be run on their own from the saved file.
+seu_merged <- JoinLayers(seu_merged)
+
+## Per-sample cell-type proportions
+prop_df <- seu_merged@meta.data %>%
+  group_by(patient, tissue, major_celltype) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(patient, tissue) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+## Visual: stacked bar of composition per sample, faceted by tissue
+p_bar <- prop_df %>%
+  ggplot(aes(x = patient, y = prop, fill = major_celltype)) +
+  geom_col() +
+  facet_grid(~ tissue, scales = "free_x", space = "free_x") +
+  theme_minimal() +
+  labs(y = "Proportion of cells", x = NULL, fill = "Cell type") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggsave("figures/05_composition_stacked_bar.png", p_bar, width = 12, height = 6, dpi = 150)
+
+## Statistical comparison: Primary (PT) vs Metastatic (PVTT+MLN)
+comp_pt_vs_met <- prop_df %>%
+  filter(tissue %in% c("PT", "PVTT", "MLN")) %>%
+  mutate(group = ifelse(tissue == "PT", "Primary", "Metastatic")) %>%
+  group_by(major_celltype) %>%
+  summarise(
+    p_value = tryCatch(
+      wilcox.test(prop ~ group)$p.value,
+      error = function(e) NA
+    ),
+    mean_primary    = mean(prop[group == "Primary"], na.rm = TRUE),
+    mean_metastatic = mean(prop[group == "Metastatic"], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(p_value)
+
+print(comp_pt_vs_met, width = Inf)
+
+write_csv(comp_pt_vs_met, "results/composition_PT_vs_Metastatic.csv")
+
+
+## =================================================================
+## SECTION 13 — RESEARCH QUESTION, PART 2: Transcriptional
+## landscape — differential expression within matched cell types,
+## Primary (PT) vs Metastatic (PVTT)
+## Result: results/DE_<CellType>_PT_vs_PVTT.csv  (x3)
+## =================================================================
+
+Idents(seu_merged) <- seu_merged$tissue
+
+## ---- Hepatocytes (the malignant cells themselves) ----
+hep_cells <- subset(seu_merged, subset = major_celltype == "Hepatocyte" &
+                                          tissue %in% c("PT", "PVTT"))
+
+de_hep_pt_vs_pvtt <- FindMarkers(
+  hep_cells, ident.1 = "PT", ident.2 = "PVTT",
+  test.use = "wilcox", min.pct = 0.1, logfc.threshold = 0.25
+)
+
+write.csv(de_hep_pt_vs_pvtt, "results/DE_Hepatocyte_PT_vs_PVTT.csv")
+
+## ---- Myeloid cells (macrophages etc.) ----
+myeloid_cells <- subset(seu_merged, subset = major_celltype == "Myeloid" &
+                                              tissue %in% c("PT", "PVTT"))
+
+de_myeloid_pt_vs_pvtt <- FindMarkers(
+  myeloid_cells, ident.1 = "PT", ident.2 = "PVTT",
+  test.use = "wilcox", min.pct = 0.1, logfc.threshold = 0.25
+)
+
+write.csv(de_myeloid_pt_vs_pvtt, "results/DE_Myeloid_PT_vs_PVTT.csv")
+
+## ---- T/NK cells ----
+tnk_cells <- subset(seu_merged, subset = major_celltype == "T/NK" &
+                                          tissue %in% c("PT", "PVTT"))
+
+de_tnk_pt_vs_pvtt <- FindMarkers(
+  tnk_cells, ident.1 = "PT", ident.2 = "PVTT",
+  test.use = "wilcox", min.pct = 0.1, logfc.threshold = 0.25
+)
+
+write.csv(de_tnk_pt_vs_pvtt, "results/DE_TNK_PT_vs_PVTT.csv")
+
+
+## =================================================================
+## SECTION 14 — UMAP figures
+## Result: figures/01_umap_by_celltype_paper.png
+##         figures/02_final_umap_celltype.png
+##         figures/03_final_umap_tissue.png
+##         figures/04_final_umap_celltype_tissue.png
+## =================================================================
+
+## UMAP validation: colored by the authors' original cell-type labels,
+## with cell-type names written on the plot
+p0 <- DimPlot(seu_merged, reduction = "umap", group.by = "celltype_paper",
+              label = TRUE, repel = TRUE, label.size = 4) +
+  NoLegend() + ggtitle("Original authors' labels")
+ggsave("figures/01_umap_by_celltype_paper.png", p0, width = 7, height = 6, dpi = 150)
+
+## UMAP: our own cell-type annotation
+p1 <- DimPlot(seu_merged, reduction = "umap", group.by = "major_celltype",
+              label = TRUE) + NoLegend() + ggtitle("Cell types")
+ggsave("figures/02_final_umap_celltype.png", p1, width = 7, height = 6, dpi = 150)
+
+## UMAP: tissue of origin
+p2 <- DimPlot(seu_merged, reduction = "umap", group.by = "tissue") +
+  ggtitle("Tissue")
+ggsave("figures/03_final_umap_tissue.png", p2, width = 7, height = 6, dpi = 150)
+
+## Combined UMAP: cell type + tissue side by side
+ggsave("figures/04_final_umap_celltype_tissue.png", p1 + p2, width = 12, height = 5, dpi = 150)
+
+
+## =================================================================
+## SECTION 15 — Top DE genes: bar chart, dot plot, volcano plot
+## (Hepatocytes, PT vs PVTT)
+## Result: figures/06_barchart_top_genes_hepatocyte.png
+##         figures/07_dotplot_top_genes_hepatocyte.png
+##         figures/08_volcano_hepatocyte_PT_vs_PVTT.png
+## =================================================================
+
+top_genes <- rownames(de_hep_pt_vs_pvtt[order(de_hep_pt_vs_pvtt$p_val_adj), ])[1:15]
+
+hep_only <- subset(seu_merged, subset = major_celltype == "Hepatocyte" &
+                                         tissue %in% c("PT", "PVTT"))
+
+## ---- Bar chart: quick visual summary of the top 15 genes ----
+top_genes_df <- de_hep_pt_vs_pvtt[top_genes, ] %>%
+  rownames_to_column("gene") %>%
+  mutate(gene = fct_reorder(gene, avg_log2FC))
+
+p_bar_genes <- ggplot(top_genes_df, aes(x = gene, y = avg_log2FC, fill = avg_log2FC > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#2166AC", "FALSE" = "firebrick"),
+                     labels = c("TRUE" = "Higher in PT", "FALSE" = "Higher in PVTT")) +
+  theme_minimal(base_size = 13) +
+  labs(title = "Top 15 Differentially Expressed Genes",
+       subtitle = "Hepatocytes: Primary Tumor vs PVTT",
+       x = NULL, y = expression(log[2]~"Fold Change"),
+       fill = NULL) +
+  theme(legend.position = "top")
+
+ggsave("figures/06_barchart_top_genes_hepatocyte.png", p_bar_genes, width = 8, height = 6, dpi = 150)
+
+## ---- Dot plot: expression level + percent expressing, per tissue ----
+p_dotplot <- DotPlot(hep_only, features = top_genes, group.by = "tissue") +
+  RotatedAxis() +
+  theme(axis.text.x = element_text(size = 9)) +
+  labs(title = "Top 15 DE Genes: Expression by Tissue", x = NULL, y = NULL)
+
+ggsave("figures/07_dotplot_top_genes_hepatocyte.png", p_dotplot, width = 9, height = 4, dpi = 150)
+
+## ---- Volcano plot: all hepatocyte genes, PT vs PVTT ----
+volcano_df <- de_hep_pt_vs_pvtt %>%
+  rownames_to_column("gene") %>%
+  mutate(
+    significant = p_val_adj < 0.05 & abs(avg_log2FC) > 1,
+    label       = ifelse(significant & rank(p_val_adj) <= 15, gene, "")
+  )
+
+p_volcano <- ggplot(volcano_df, aes(x = avg_log2FC, y = -log10(p_val_adj), color = significant)) +
+  geom_point(alpha = 0.6, size = 0.8) +
+  geom_text_repel(aes(label = label), size = 3.2, max.overlaps = 20,
+                   color = "black", fontface = "italic") +
+  scale_color_manual(values = c("TRUE" = "#2166AC", "FALSE" = "grey80")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey50") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title    = "Differential Expression: Hepatocytes, Primary Tumor vs PVTT",
+    subtitle = "Genes labeled: top 15 by adjusted p-value",
+    x        = expression(log[2]~"Fold Change (PT vs PVTT)"),
+    y        = expression(-log[10]~"adjusted p-value")
+  ) +
+  theme(
+    legend.position  = "none",
+    plot.title       = element_text(face = "bold", size = 15),
+    plot.subtitle    = element_text(color = "grey40"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("figures/08_volcano_hepatocyte_PT_vs_PVTT.png", p_volcano, width = 8, height = 6, dpi = 150)
+
+
+## =================================================================
+## SECTION 16 — Canonical marker dot plot (annotation validation)
+## Result: figures/09_dotplot_canonical_markers.png
+##
+## Marker genes follow Fig. 1b of Lu et al. (2022). Because clusters
+## were named by majority vote against the authors' labels
+## (Section 11), this plot validates the annotation: each cell type
+## should express its expected markers (diagonal pattern).
+## =================================================================
+
+DefaultAssay(seu_merged) <- "RNA"
+
+ct_order <- c("Hepatocyte", "T/NK", "Myeloid", "B", "Endothelial", "Fibroblast")
+seu_merged$major_celltype <- factor(seu_merged$major_celltype, levels = ct_order)
+
+markers <- c("ALB", "SERPINA1", "HNF4A", "EPCAM",          # hepatocyte
+             "CD3D", "CD3E", "NKG7",                       # T/NK
+             "CD68", "CD14", "CD163", "CD1C", "CLEC4C", "KIT",  # myeloid
+             "IGHG1", "JCHAIN", "CD79A",                   # B
+             "VWF", "PECAM1", "FCGR2B",                    # endothelial
+             "ACTA2", "COL1A1", "COL1A2")                  # fibroblast
+markers <- markers[markers %in% rownames(seu_merged)]
+
+p_dot_markers <- DotPlot(seu_merged, features = markers, group.by = "major_celltype",
+                         dot.scale = 9) +
+  scale_color_gradientn(colours = c("#4575B4", "#FFFFBF", "#D73027"),
+                        name = "Average\nexpression") +
+  scale_y_discrete(limits = rev(levels(seu_merged$major_celltype))) +
+  theme_bw(base_size = 14) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "grey90"),
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold", color = "black"),
+    axis.text.y = element_text(face = "bold", color = "black", size = 14),
+    plot.title  = element_text(face = "bold")
+  ) +
+  labs(title = "Canonical marker genes by cell type", x = NULL, y = NULL)
+
+ggsave("figures/09_dotplot_canonical_markers.png", p_dot_markers,
+       width = 11, height = 4.5, dpi = 150, bg = "white")
+
+
+## =================================================================
+## END OF ANALYSIS
+## See results/ for all CSV tables and figures/ for all plots
+## (numbered 01-09 in logical viewing order).
+## See RESULTS_SUMMARY.md for the write-up answering the research
+## question based on these outputs.
+## =================================================================
